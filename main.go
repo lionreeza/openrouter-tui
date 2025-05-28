@@ -9,10 +9,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/spf13/viper"
 
@@ -67,201 +67,6 @@ type ChatUI struct {
 	mu             sync.Mutex
 	loadingActive  bool
 	assistantText  *strings.Builder // Buffer for assistant's current response
-	markdownParser *MarkdownParser
-}
-
-// MarkdownParser handles Markdown rendering for assistant responses
-type MarkdownParser struct {
-	inBold   bool
-	inItalic bool
-	inCode   bool
-	inQuote  bool
-	inList   bool
-	buf      *strings.Builder
-}
-
-func NewMarkdownParser() *MarkdownParser {
-	return &MarkdownParser{
-		buf: &strings.Builder{},
-	}
-}
-
-// Reset resets the parser state for a new message
-func (p *MarkdownParser) Reset() {
-	p.inBold = false
-	p.inItalic = false
-	p.inCode = false
-	p.inQuote = false
-	p.inList = false
-	p.buf.Reset()
-}
-
-// RenderMarkdown formats Markdown content with TUI styling
-func (p *MarkdownParser) RenderMarkdown(text string) []byte {
-	p.Reset()
-	lines := strings.Split(text, "\n")
-	output := &strings.Builder{}
-	prevLineEmpty := true
-
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		lineEmpty := trimmed == ""
-
-		// Skip consecutive empty lines
-		if lineEmpty && prevLineEmpty {
-			continue
-		}
-		prevLineEmpty = lineEmpty
-
-		if strings.HasPrefix(trimmed, "```") {
-			// Don't render code blocks for now
-			continue
-		}
-
-		if strings.HasPrefix(trimmed, "|") && strings.Contains(trimmed, "|") {
-			// Handle table rows
-			if i > 0 && strings.HasPrefix(strings.TrimSpace(lines[i-1]), "|") {
-				p.buf.Reset()
-				cells := strings.Split(trimmed, "|")
-				for _, cell := range cells {
-					cell = strings.TrimSpace(cell)
-					if cell != "" {
-						fmt.Fprintf(p.buf, "[::b]%s[::-] ", cell)
-					}
-				}
-				output.WriteString(p.buf.String() + "\n")
-			}
-		} else if strings.HasPrefix(trimmed, "> ") {
-			// Blockquote formatting
-			if !p.inQuote {
-				p.buf.WriteString("[darkcyan]│ [::-]")
-				p.inQuote = true
-			}
-			content := filteredString(trimmed[2:])
-			p.markdownLine(content)
-			output.WriteString(p.buf.String() + "\n")
-		} else if strings.HasPrefix(trimmed, "- ") {
-			// List formatting
-			if !p.inList {
-				p.buf.WriteString(" • ")
-				p.inList = true
-			}
-			content := filteredString(trimmed[2:])
-			p.markdownLine(content)
-			output.WriteString(p.buf.String() + "\n")
-		} else if strings.HasPrefix(trimmed, "* ") {
-			// List formatting
-			if !p.inList {
-				p.buf.WriteString(" • ")
-				p.inList = true
-			}
-			content := filteredString(trimmed[2:])
-			p.markdownLine(content)
-			output.WriteString(p.buf.String() + "\n")
-		} else if lineEmpty {
-			// Reset formatting states on empty line
-			if p.inList {
-				p.inList = false
-			}
-			if p.inQuote {
-				p.inQuote = false
-			}
-			output.WriteString("\n")
-		} else {
-			// Regular text formatting
-			content := filteredString(line)
-			p.markdownLine(content)
-			output.WriteString(p.buf.String() + "\n")
-		}
-	}
-
-	return []byte(output.String())
-}
-
-func filteredString(s string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsPrint(r) {
-			return r
-		}
-		return -1
-	}, s)
-}
-
-func (p *MarkdownParser) markdownLine(line string) {
-	if p.buf == nil {
-		p.buf = &strings.Builder{}
-	} else {
-		p.buf.Reset()
-	}
-
-	active := false
-	pos := 0
-
-	// Process the line for text formatting
-	for i := 0; i < len(line); i++ {
-		// Handle backslash escapes
-		if i > 0 && line[i-1] == '\\' {
-			continue
-		}
-
-		switch {
-		case strings.HasPrefix(line[i:], "**") && !p.inCode:
-			if active {
-				p.buf.WriteString("[::-][white]")
-				active = false
-				i++ // Skip both asterisks
-			} else {
-				p.buf.WriteString("[::b][white]")
-				active = true
-				i++ // Skip both asterisks
-			}
-		case strings.HasPrefix(line[i:], "__") && !p.inCode:
-			if active {
-				p.buf.WriteString("[::-][white]")
-				active = false
-				i++ // Skip both underscores
-			} else {
-				p.buf.WriteString("[::u][white]")
-				active = true
-				i++ // Skip both underscores
-			}
-		case line[i] == '*' && !p.inCode:
-			if active {
-				p.buf.WriteString("[::-][white]")
-				active = false
-			} else {
-				p.buf.WriteString("[::i][white]")
-				active = true
-			}
-		case line[i] == '_' && !p.inCode:
-			if active {
-				p.buf.WriteString("[::-][white]")
-				active = false
-			} else {
-				p.buf.WriteString("[::i][white]")
-				active = true
-			}
-		case strings.HasPrefix(line[i:], "`") && !p.inCode:
-			if !p.inCode {
-				p.buf.WriteString("[::r]")
-				p.inCode = true
-				active = !active
-			} else {
-				p.buf.WriteString("[::-][white]")
-				p.inCode = false
-				active = !active
-			}
-			i += 1
-		default:
-			pos = i
-			p.buf.WriteByte(line[pos])
-		}
-	}
-
-	// Close any open formatting at the end of the line
-	if active {
-		p.buf.WriteString("[::-]")
-	}
 }
 
 func loadConfig() (*Config, error) {
@@ -275,6 +80,10 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
 
+	v.SetDefault("openrouter.model", "openai/gpt-3.5-turbo")
+	v.SetDefault("openrouter.timeout", 30)
+	v.SetDefault("openrouter.max_tokens", 512)
+
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
@@ -285,10 +94,9 @@ func loadConfig() (*Config, error) {
 
 func NewChatUI(cfg *Config) *ChatUI {
 	return &ChatUI{
-		app:            tview.NewApplication(),
-		cfg:            cfg,
-		messages:       []Message{},
-		markdownParser: NewMarkdownParser(),
+		app:      tview.NewApplication(),
+		cfg:      cfg,
+		messages: []Message{},
 		client: &http.Client{
 			Timeout: time.Duration(cfg.OpenRouter.Timeout) * time.Second,
 		},
@@ -306,6 +114,7 @@ func (ui *ChatUI) SetupUI() {
 			ui.app.Draw()
 		})
 	ui.chatHistory.SetBorder(true).SetTitle(" Conversation ").SetBorderColor(tcell.ColorBlue)
+	ui.chatHistory.SetText("Welcome to OpenRouter Chat! Enter your message below and press Enter to send.")
 
 	// Configure the loading spinner
 	ui.loadingSpinner = tview.NewTextView()
@@ -354,7 +163,7 @@ func (ui *ChatUI) SetupUI() {
 
 func (ui *ChatUI) Run() error {
 	ui.SetupUI()
-	return ui.app.SetRoot(ui.flex, true).EnableMouse(true).SetFocus(ui.inputField).Run()
+	return ui.app.SetRoot(ui.flex, true).EnableMouse(true).Run()
 }
 
 func (ui *ChatUI) UpdateStatus(text string) {
@@ -393,43 +202,27 @@ func (ui *ChatUI) StopLoading() {
 	ui.app.SetFocus(ui.inputField)
 }
 
-// AddMessage adds a raw message to history without rendering
 func (ui *ChatUI) AddMessage(role, content string) {
 	ui.messages = append(ui.messages, Message{Role: role, Content: content})
 }
 
-// AppendToChat renders and displays a message in the chat view
 func (ui *ChatUI) AppendToChat(role, text string) {
 	switch role {
 	case "You":
-		fmt.Fprintf(ui.chatHistory, "[purple]You:[-] [white]%s\n", ui.formatPlainMessage(text))
+		fmt.Fprintf(ui.chatHistory, "[purple]You:[-] [white]%s\n", text)
 	case "Assistant":
-		fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] %s\n", ui.formatMarkdown(text))
+		fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] [white]%s\n", text)
 	case "System":
-		fmt.Fprintf(ui.chatHistory, "[red]System:[-] [red]%s\n", text)
+		fmt.Fprintf(ui.chatHistory, "[red]System:[-] %s\n", text)
+	default:
+		fmt.Fprintf(ui.chatHistory, "[white]%s:[-] %s\n", role, text)
 	}
 	ui.chatHistory.ScrollToEnd()
 }
 
-// AppendToChatPlain appends a partial assistant message during streaming
-func (ui *ChatUI) AppendToChatPlain(role, text string) {
-	fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] [yellow]%s", text)
+func (ui *ChatUI) AppendPartialAssistant(prefix, text string) {
+	fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] %s%s", prefix, text)
 	ui.chatHistory.ScrollToEnd()
-}
-
-// formatPlainMessage prepares non-assistant messages for display
-func (ui *ChatUI) formatPlainMessage(text string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsPrint(r) {
-			return r
-		}
-		return -1
-	}, text)
-}
-
-// formatMarkdown renders Markdown content for TUI
-func (ui *ChatUI) formatMarkdown(text string) []byte {
-	return ui.markdownParser.RenderMarkdown(text)
 }
 
 func (ui *ChatUI) handleInput(input string) {
@@ -439,7 +232,6 @@ func (ui *ChatUI) handleInput(input string) {
 
 	// Start loading animation and begin assistant response line
 	ui.StartLoading()
-	ui.AppendToChatPlain("Assistant", "")
 
 	// Send request to OpenRouter in a separate goroutine
 	go func() {
@@ -483,16 +275,15 @@ func (ui *ChatUI) handleInput(input string) {
 			errBody, err := io.ReadAll(resp.Body)
 			if err != nil {
 				ui.handleStreamError("Failed to read error response: " + err.Error())
-				return
+			} else {
+				ui.handleStreamError(fmt.Sprintf("API error: %s - %s", resp.Status, string(errBody)))
 			}
-			errMsg := fmt.Sprintf("API error: %s - %s", resp.Status, string(errBody))
-			ui.handleStreamError(errMsg)
 			return
 		}
 
 		// Process SSE streaming response
 		reader := bufio.NewReader(resp.Body)
-		isFirst := true
+		var responseStarted bool
 
 		for {
 			line, err := reader.ReadString('\n')
@@ -500,7 +291,7 @@ func (ui *ChatUI) handleInput(input string) {
 				if errors.Is(err, io.EOF) {
 					break
 				}
-				ui.appendSystemError("Stream read error: " + err.Error())
+				log.Printf("Stream read error: %v", err)
 				break
 			}
 
@@ -514,14 +305,14 @@ func (ui *ChatUI) handleInput(input string) {
 				jsonStr := strings.TrimPrefix(line, "data:")
 				jsonStr = strings.TrimSpace(jsonStr)
 
-				// Check for special "[DONE]" message
+				// Check for special "[极ONE]" message
 				if jsonStr == "[DONE]" {
 					break
 				}
 
 				var chunk CompletionResponse
 				if err := json.Unmarshal([]byte(jsonStr), &chunk); err != nil {
-					ui.appendSystemError("JSON parse error: " + err.Error())
+					log.Printf("JSON parse error: %v", err)
 					continue
 				}
 
@@ -529,96 +320,107 @@ func (ui *ChatUI) handleInput(input string) {
 					delta := chunk.Choices[0].Delta.Content
 					ui.assistantText.WriteString(delta)
 
-					// Update UI with the new content
-					ui.app.QueueUpdateDraw(func() {
-						// For the first chunk, setup the assistant line
-						if isFirst {
-							ui.chatHistory.SetText(strings.TrimSuffix(ui.chatHistory.GetText(true), "\n"))
-							ui.AppendToChatPlain("Assistant", "[yellow]")
-							isFirst = false
-						}
-
-						ui.appendDelta(delta)
-					})
+					if !responseStarted {
+						responseStarted = true
+						ui.app.QueueUpdateDraw(func() {
+							ui.AppendPartialAssistant("[yellow]", delta)
+						})
+					} else {
+						ui.app.QueueUpdateDraw(func() {
+							fmt.Fprint(ui.chatHistory, "[yellow]"+delta)
+							ui.chatHistory.ScrollToEnd()
+						})
+					}
 				}
 			}
 		}
 
-		// Add final assistant response
-		finalResponse := ui.assistantText.String()
-		if finalResponse != "" {
-			ui.app.QueueUpdateDraw(func() {
-				// Save assistant response to message history
-				ui.AddMessage("assistant", finalResponse)
-				ui.StopLoading()
+		// Handle the final response
+		ui.app.QueueUpdateDraw(func() {
+			finalResponse := ui.assistantText.String()
+			responseText := strings.TrimSpace(finalResponse)
 
-				// Format and render the completed message
-				ui.finalizeAssistantMessage()
-			})
-		} else {
+			if responseText != "" {
+				// Update the assistant message with final formatting
+				ui.addCompletedAssistantMessage(finalResponse)
+			} else if !responseStarted {
+				log.Println("Assistant returned an empty response")
+				ui.AppendToChat("System", "Assistant returned an empty response")
+				fmt.Fprint(ui.chatHistory, "\n") // Ensure new line
+			}
+
 			ui.StopLoading()
-			ui.appendSystemError("Received empty response from assistant")
-		}
+			ui.chatHistory.ScrollToEnd()
+		})
 	}()
 }
 
-// appendDelta adds a new chunk to the assistant response in yellow
-func (ui *ChatUI) appendDelta(delta string) {
-	currentText := ui.chatHistory.GetText(true)
+func (ui *ChatUI) addCompletedAssistantMessage(text string) {
+	// Get current text content
+	current := ui.chatHistory.GetText(true)
 
-	// Split into lines, remove the last line and append the new delta
-	lines := strings.Split(currentText, "\n")
+	// Remove yellow formatting from last line
+	lines := strings.Split(current, "\n")
+
+	// Only process if we have at least one line
 	if len(lines) > 0 {
-		// Replace last line with updated content
+		lastLine := lines[len(lines)-1]
+
+		// Clean up yellow styling markers
+		lastLine = strings.TrimSuffix(lastLine, "[yellow]")
 		lines = lines[:len(lines)-1]
+
+		// Reconstruct the chat history text
+		ui.chatHistory.SetText(strings.Join(lines, "\n") + "\n")
 	}
 
-	// Add all previous lines plus the updated assistant response
-	newText := strings.Join(lines, "\n")
-	if newText != "" {
-		newText += "\n"
-	}
-	newText += fmt.Sprintf("[blue]Assistant:[-] [yellow]%s", ui.assistantText.String())
-	ui.chatHistory.SetText(newText)
-	ui.chatHistory.ScrollToEnd()
-}
-
-// finalizeAssistantMessage formats and renders the completed assistant message
-func (ui *ChatUI) finalizeAssistantMessage() {
-	currentText := ui.chatHistory.GetText(true)
-	lines := strings.Split(currentText, "\n")
-
-	// Remove the last line (which contains the incomplete yellow text)
-	if len(lines) > 0 {
-		lines = lines[:len(lines)-1]
-	}
-
-	// Format the completed message
-	formatted := ui.formatMarkdown(ui.assistantText.String())
-
-	// Add the formatted response
-	lines = append(lines, fmt.Sprintf("[blue]Assistant:[-] %s", formatted))
-	ui.chatHistory.SetText(strings.Join(lines, "\n"))
-	ui.chatHistory.ScrollToEnd()
+	text = strings.TrimSuffix(text, "\n")
+	ui.AppendToChat("Assistant", text)
 }
 
 func (ui *ChatUI) handleStreamError(msg string) {
 	ui.app.QueueUpdateDraw(func() {
 		ui.StopLoading()
-		ui.AppendToChat("System", "Error: "+msg)
-	})
-}
-
-func (ui *ChatUI) appendSystemError(msg string) {
-	ui.app.QueueUpdateDraw(func() {
-		ui.AppendToChatPlain("System", msg)
+		ui.AppendToChat("System", msg)
 	})
 }
 
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Fatalf("Config Error: %v", err)
+		log.Printf("Config error: %v", err)
+
+		// Try to create default config if it doesn't exist
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			log.Println("Creating default config file...")
+
+			// Create file if it doesn't exist
+			if _, err := os.Stat("config.yaml"); os.IsNotExist(err) {
+				if _, createErr := os.Create("config.yaml"); createErr != nil {
+					log.Fatalf("Failed to create config file: %v", createErr)
+				}
+			}
+
+			// Set default values
+			v := viper.New()
+			v.SetConfigFile("config.yaml")
+			v.Set("openrouter", map[string]interface{}{
+				"api_key":    "your-api-key-here",
+				"model":      "openai/gpt-3.5-turbo",
+				"timeout":    30,
+				"max_tokens": 512,
+			})
+
+			if err := v.WriteConfig(); err != nil {
+				log.Fatalf("Failed to write config: %v", err)
+			}
+
+			log.Println("Created default config.yaml file. Please update with your API key.")
+			log.Println("Rerun the application after editing config.yaml")
+			os.Exit(0)
+		} else {
+			log.Fatalf("Fatal config error: %v", err)
+		}
 	}
 
 	ui := NewChatUI(cfg)
