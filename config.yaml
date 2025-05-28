@@ -1,0 +1,5 @@
+openrouter:
+  api_key: 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
+  model: "deepseek/deepseek-r1-0528:free"
+  timeout: 600
+  max_tokens: 5400
