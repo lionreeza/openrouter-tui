@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -80,10 +79,6 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
 
-	v.SetDefault("openrouter.model", "openai/gpt-3.5-turbo")
-	v.SetDefault("openrouter.timeout", 30)
-	v.SetDefault("openrouter.max_tokens", 512)
-
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
@@ -114,7 +109,6 @@ func (ui *ChatUI) SetupUI() {
 			ui.app.Draw()
 		})
 	ui.chatHistory.SetBorder(true).SetTitle(" Conversation ").SetBorderColor(tcell.ColorBlue)
-	ui.chatHistory.SetText("Welcome to OpenRouter Chat! Enter your message below and press Enter to send.")
 
 	// Configure the loading spinner
 	ui.loadingSpinner = tview.NewTextView()
@@ -209,9 +203,9 @@ func (ui *ChatUI) AddMessage(role, content string) {
 func (ui *ChatUI) AppendToChat(role, text string) {
 	switch role {
 	case "You":
-		fmt.Fprintf(ui.chatHistory, "[purple]You:[-] [white]%s\n", text)
+		fmt.Fprintf(ui.chatHistory, "[purple]You:[-] [white]%s[-]\n", text)
 	case "Assistant":
-		fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] [white]%s\n", text)
+		fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] [white]%s[-]\n", text)
 	case "System":
 		fmt.Fprintf(ui.chatHistory, "[red]System:[-] %s\n", text)
 	default:
@@ -220,8 +214,8 @@ func (ui *ChatUI) AppendToChat(role, text string) {
 	ui.chatHistory.ScrollToEnd()
 }
 
-func (ui *ChatUI) AppendPartialAssistant(prefix, text string) {
-	fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] %s%s", prefix, text)
+func (ui *ChatUI) AppendToChatPlain(role, text string) {
+	fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] [yellow]%s", text)
 	ui.chatHistory.ScrollToEnd()
 }
 
@@ -232,6 +226,7 @@ func (ui *ChatUI) handleInput(input string) {
 
 	// Start loading animation and begin assistant response line
 	ui.StartLoading()
+	ui.AppendToChatPlain("Assistant", "")
 
 	// Send request to OpenRouter in a separate goroutine
 	go func() {
@@ -272,18 +267,15 @@ func (ui *ChatUI) handleInput(input string) {
 
 		if resp.StatusCode != http.StatusOK {
 			// Read the error response
-			errBody, err := io.ReadAll(resp.Body)
-			if err != nil {
-				ui.handleStreamError("Failed to read error response: " + err.Error())
-			} else {
-				ui.handleStreamError(fmt.Sprintf("API error: %s - %s", resp.Status, string(errBody)))
-			}
+			errBody, _ := io.ReadAll(resp.Body)
+			errMsg := fmt.Sprintf("API error: %s - %s", resp.Status, string(errBody))
+			ui.handleStreamError(errMsg)
 			return
 		}
 
 		// Process SSE streaming response
 		reader := bufio.NewReader(resp.Body)
-		var responseStarted bool
+		isFirst := true
 
 		for {
 			line, err := reader.ReadString('\n')
@@ -291,7 +283,7 @@ func (ui *ChatUI) handleInput(input string) {
 				if errors.Is(err, io.EOF) {
 					break
 				}
-				log.Printf("Stream read error: %v", err)
+				ui.appendSystemError("Stream read error: " + err.Error())
 				break
 			}
 
@@ -305,14 +297,14 @@ func (ui *ChatUI) handleInput(input string) {
 				jsonStr := strings.TrimPrefix(line, "data:")
 				jsonStr = strings.TrimSpace(jsonStr)
 
-				// Check for special "[极ONE]" message
+				// Check for special "[DONE]" message
 				if jsonStr == "[DONE]" {
 					break
 				}
 
 				var chunk CompletionResponse
 				if err := json.Unmarshal([]byte(jsonStr), &chunk); err != nil {
-					log.Printf("JSON parse error: %v", err)
+					ui.appendSystemError("JSON parse error: " + err.Error())
 					continue
 				}
 
@@ -320,67 +312,96 @@ func (ui *ChatUI) handleInput(input string) {
 					delta := chunk.Choices[0].Delta.Content
 					ui.assistantText.WriteString(delta)
 
-					if !responseStarted {
-						responseStarted = true
-						ui.app.QueueUpdateDraw(func() {
-							ui.AppendPartialAssistant("[yellow]", delta)
-						})
-					} else {
-						ui.app.QueueUpdateDraw(func() {
-							fmt.Fprint(ui.chatHistory, "[yellow]"+delta)
-							ui.chatHistory.ScrollToEnd()
-						})
-					}
+					// Update UI with the new content
+					ui.app.QueueUpdateDraw(func() {
+						// For the first chunk, setup the assistant line
+						if isFirst {
+							ui.AppendToChatPlain("Assistant", "[yellow]")
+							isFirst = false
+						}
+
+						ui.appendDelta(delta)
+					})
 				}
 			}
 		}
 
-		// Handle the final response
-		ui.app.QueueUpdateDraw(func() {
-			finalResponse := ui.assistantText.String()
-			responseText := strings.TrimSpace(finalResponse)
+		// Add final assistant response
+		finalResponse := ui.assistantText.String()
+		if finalResponse != "" {
+			ui.app.QueueUpdateDraw(func() {
+				// Save assistant response to message history
+				ui.AddMessage("assistant", finalResponse)
+				ui.StopLoading()
 
-			if responseText != "" {
-				// Update the assistant message with final formatting
-				ui.addCompletedAssistantMessage(finalResponse)
-			} else if !responseStarted {
-				log.Println("Assistant returned an empty response")
-				ui.AppendToChat("System", "Assistant returned an empty response")
-				fmt.Fprint(ui.chatHistory, "\n") // Ensure new line
-			}
-
+				// Remove the streaming marker and reset to white
+				ui.finalizeAssistantMessage()
+			})
+		} else {
 			ui.StopLoading()
-			ui.chatHistory.ScrollToEnd()
-		})
+		}
 	}()
 }
 
-func (ui *ChatUI) addCompletedAssistantMessage(text string) {
-	// Get current text content
-	current := ui.chatHistory.GetText(true)
+// appendDelta adds a new chunk to the assistant response in yellow
+func (ui *ChatUI) appendDelta(delta string) {
+	currentText := ui.chatHistory.GetText(true)
 
-	// Remove yellow formatting from last line
-	lines := strings.Split(current, "\n")
-
-	// Only process if we have at least one line
+	// Find last line and append new content
+	lines := strings.Split(currentText, "\n")
 	if len(lines) > 0 {
 		lastLine := lines[len(lines)-1]
 
-		// Clean up yellow styling markers
-		lastLine = strings.TrimSuffix(lastLine, "[yellow]")
-		lines = lines[:len(lines)-1]
+		// Handle the case where we might have ANSI codes at the end
+		if strings.HasSuffix(lastLine, "[-]") {
+			lastLine = strings.TrimSuffix(lastLine, "[-]")
+		}
 
-		// Reconstruct the chat history text
-		ui.chatHistory.SetText(strings.Join(lines, "\n") + "\n")
+		// Append the new delta
+		lastLine += delta
+
+		// Note: We explicitly keep yellow open for additional tokens
+		lastLine += "[yellow]"
+
+		// Update the last line
+		lines[len(lines)-1] = lastLine
+		ui.chatHistory.SetText(strings.Join(lines, "\n"))
 	}
 
-	text = strings.TrimSuffix(text, "\n")
-	ui.AppendToChat("Assistant", text)
+	ui.chatHistory.ScrollToEnd()
+}
+
+// finalizeAssistantMessage removes yellow coloring from the assistant's message
+func (ui *ChatUI) finalizeAssistantMessage() {
+	currentText := ui.chatHistory.GetText(true)
+	lines := strings.Split(currentText, "\n")
+
+	if len(lines) == 0 {
+		return
+	}
+
+	// Process the last line (assistant's response)
+	lastLine := lines[len(lines)-1]
+
+	// Remove any open yellow tags and their endings
+	lastLine = strings.ReplaceAll(lastLine, "[yellow]", "")
+	lastLine = strings.ReplaceAll(lastLine, "[-]", "")
+
+	// Recolor assistant response to white
+	lines[len(lines)-1] = lastLine
+	ui.chatHistory.SetText(strings.Join(lines, "\n") + "\n")
+	ui.chatHistory.ScrollToEnd()
 }
 
 func (ui *ChatUI) handleStreamError(msg string) {
 	ui.app.QueueUpdateDraw(func() {
 		ui.StopLoading()
+		ui.AppendToChat("System", "Error: "+msg)
+	})
+}
+
+func (ui *ChatUI) appendSystemError(msg string) {
+	ui.app.QueueUpdateDraw(func() {
 		ui.AppendToChat("System", msg)
 	})
 }
@@ -388,39 +409,7 @@ func (ui *ChatUI) handleStreamError(msg string) {
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Printf("Config error: %v", err)
-
-		// Try to create default config if it doesn't exist
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			log.Println("Creating default config file...")
-
-			// Create file if it doesn't exist
-			if _, err := os.Stat("config.yaml"); os.IsNotExist(err) {
-				if _, createErr := os.Create("config.yaml"); createErr != nil {
-					log.Fatalf("Failed to create config file: %v", createErr)
-				}
-			}
-
-			// Set default values
-			v := viper.New()
-			v.SetConfigFile("config.yaml")
-			v.Set("openrouter", map[string]interface{}{
-				"api_key":    "your-api-key-here",
-				"model":      "openai/gpt-3.5-turbo",
-				"timeout":    30,
-				"max_tokens": 512,
-			})
-
-			if err := v.WriteConfig(); err != nil {
-				log.Fatalf("Failed to write config: %v", err)
-			}
-
-			log.Println("Created default config.yaml file. Please update with your API key.")
-			log.Println("Rerun the application after editing config.yaml")
-			os.Exit(0)
-		} else {
-			log.Fatalf("Fatal config error: %v", err)
-		}
+		log.Fatalf("Config Error: %v", err)
 	}
 
 	ui := NewChatUI(cfg)
