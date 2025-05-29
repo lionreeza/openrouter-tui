@@ -9,23 +9,22 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/spf13/viper"
+	"unicode"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"github.com/spf13/viper"
 )
 
-// Message represents a chat message
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-// CompletionRequest is the request payload for OpenRouter
 type CompletionRequest struct {
 	Model     string    `json:"model"`
 	Messages  []Message `json:"messages"`
@@ -33,7 +32,6 @@ type CompletionRequest struct {
 	MaxTokens int       `json:"max_tokens,omitempty"`
 }
 
-// CompletionResponse represents each chunk of streaming response
 type CompletionResponse struct {
 	Choices []struct {
 		Delta struct {
@@ -42,7 +40,6 @@ type CompletionResponse struct {
 	} `json:"choices"`
 }
 
-// Config holds the application configuration
 type Config struct {
 	OpenRouter struct {
 		APIKey    string `mapstructure:"api_key"`
@@ -52,7 +49,187 @@ type Config struct {
 	} `mapstructure:"openrouter"`
 }
 
-// ChatUI manages the terminal UI
+// MarkdownParser handles Markdown rendering for assistant responses
+type MarkdownParser struct {
+	inBold      bool
+	inItalic    bool
+	inCode      bool
+	inQuote     bool
+	inList      bool
+	buffer      *strings.Builder
+	partialMode bool // For streaming mode
+}
+
+func NewMarkdownParser() *MarkdownParser {
+	return &MarkdownParser{
+		buffer: &strings.Builder{},
+	}
+}
+
+func (p *MarkdownParser) Reset() {
+	p.inBold = false
+	p.inItalic = false
+	p.inCode = false
+	p.inQuote = false
+	p.inList = false
+	p.buffer.Reset()
+}
+
+// RenderMarkdown renders complete text
+func (p *MarkdownParser) RenderMarkdown(text string) []byte {
+	return p.renderInternal(text, false)
+}
+
+// RenderPartial renders text incrementally (for streaming)
+func (p *MarkdownParser) RenderPartial(text string) []byte {
+	return p.renderInternal(text, true)
+}
+
+func (p *MarkdownParser) renderInternal(text string, partial bool) []byte {
+	p.partialMode = partial
+	p.Reset()
+	lines := strings.Split(text, "\n")
+	output := &strings.Builder{}
+	prevLineEmpty := true
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lineEmpty := trimmed == ""
+
+		// Skip consecutive empty lines in partial mode
+		if lineEmpty && prevLineEmpty && partial {
+			continue
+		}
+		prevLineEmpty = lineEmpty
+
+		if strings.HasPrefix(trimmed, "```") {
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "|") && strings.Contains(trimmed, "|") {
+			// Handle tables
+			if i > 0 && strings.HasPrefix(strings.TrimSpace(lines[i-1]), "|") {
+				p.buffer.Reset()
+				cells := strings.Split(trimmed, "|")
+				for _, cell := range cells {
+					cell = strings.TrimSpace(cell)
+					if cell != "" {
+						fmt.Fprintf(p.buffer, "[::b]%s[::-] ", cell)
+					}
+				}
+				output.WriteString(p.buffer.String() + "\n")
+			}
+		} else if strings.HasPrefix(trimmed, "> ") {
+			if !p.inQuote {
+				p.buffer.WriteString("[darkcyan]│ [::-]")
+				p.inQuote = true
+			}
+			content := filteredString(trimmed[2:])
+			p.markdownLine(content)
+			output.WriteString(p.buffer.String() + "\n")
+		} else if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+			if !p.inList {
+				p.buffer.WriteString(" • ")
+				p.inList = true
+			}
+			content := filteredString(trimmed[2:])
+			p.markdownLine(content)
+			output.WriteString(p.buffer.String() + "\n")
+		} else if lineEmpty {
+			if p.inList {
+				p.inList = false
+			}
+			if p.inQuote {
+				p.inQuote = false
+			}
+			output.WriteString("\n")
+		} else {
+			content := filteredString(line)
+			p.markdownLine(content)
+			output.WriteString(p.buffer.String() + "\n")
+		}
+	}
+
+	return []byte(output.String())
+}
+
+func filteredString(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, s)
+}
+
+func (p *MarkdownParser) markdownLine(line string) {
+	p.buffer.Reset()
+	active := false
+
+	for i := 0; i < len(line); i++ {
+		if i > 0 && line[i-1] == '\\' {
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(line[i:], "**") && !p.inCode:
+			if active {
+				p.buffer.WriteString("[::-][white]")
+				active = false
+				i++
+			} else {
+				p.buffer.WriteString("[::b][white]")
+				active = true
+				i++
+			}
+		case strings.HasPrefix(line[i:], "__") && !p.inCode:
+			if active {
+				p.buffer.WriteString("[::-][white]")
+				active = false
+				i++
+			} else {
+				p.buffer.WriteString("[::u][white]")
+				active = true
+				i++
+			}
+		case line[i] == '*' && !p.inCode:
+			if active {
+				p.buffer.WriteString("[::-][white]")
+				active = false
+			} else {
+				p.buffer.WriteString("[::i][white]")
+				active = true
+			}
+		case line[i] == '_' && !p.inCode:
+			if active {
+				p.buffer.WriteString("[::-][white]")
+				active = false
+			} else {
+				p.buffer.WriteString("[::i][white]")
+				active = true
+			}
+		case strings.HasPrefix(line[i:], "`") && !p.inCode && !p.partialMode:
+			// Only handle code blocks in non-streaming mode
+			if !p.inCode {
+				p.buffer.WriteString("[::r]")
+				p.inCode = true
+				active = !active
+			} else {
+				p.buffer.WriteString("[::-][white]")
+				p.inCode = false
+				active = !active
+			}
+			i += 1
+		default:
+			p.buffer.WriteByte(line[i])
+		}
+	}
+
+	if active {
+		p.buffer.WriteString("[::-]")
+	}
+}
+
 type ChatUI struct {
 	app            *tview.Application
 	chatHistory    *tview.TextView
@@ -65,7 +242,8 @@ type ChatUI struct {
 	messages       []Message
 	mu             sync.Mutex
 	loadingActive  bool
-	assistantText  *strings.Builder // Buffer for assistant's current response
+	assistantText  *strings.Builder
+	markdownParser *MarkdownParser
 }
 
 func loadConfig() (*Config, error) {
@@ -79,9 +257,18 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
 
+	v.SetDefault("openrouter.model", "openai/gpt-3.5-turbo")
+	v.SetDefault("openrouter.timeout", 30)
+	v.SetDefault("openrouter.max_tokens", 512)
+
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	// Validate API key
+	if cfg.OpenRouter.APIKey == "" || cfg.OpenRouter.APIKey == "your-api-key-here" {
+		return nil, fmt.Errorf("API key is not configured. Please update config.yaml")
 	}
 
 	return &cfg, nil
@@ -89,9 +276,10 @@ func loadConfig() (*Config, error) {
 
 func NewChatUI(cfg *Config) *ChatUI {
 	return &ChatUI{
-		app:      tview.NewApplication(),
-		cfg:      cfg,
-		messages: []Message{},
+		app:            tview.NewApplication(),
+		cfg:            cfg,
+		messages:       []Message{},
+		markdownParser: NewMarkdownParser(),
 		client: &http.Client{
 			Timeout: time.Duration(cfg.OpenRouter.Timeout) * time.Second,
 		},
@@ -99,7 +287,6 @@ func NewChatUI(cfg *Config) *ChatUI {
 }
 
 func (ui *ChatUI) SetupUI() {
-	// Configure the chat history view
 	ui.chatHistory = tview.NewTextView().
 		SetDynamicColors(true).
 		SetRegions(true).
@@ -109,24 +296,21 @@ func (ui *ChatUI) SetupUI() {
 			ui.app.Draw()
 		})
 	ui.chatHistory.SetBorder(true).SetTitle(" Conversation ").SetBorderColor(tcell.ColorBlue)
+	ui.chatHistory.SetText("Welcome to OpenRouter Chat!\nEnter your message below and press Enter to send.")
 
-	// Configure the loading spinner
 	ui.loadingSpinner = tview.NewTextView()
 	ui.loadingSpinner.SetTextAlign(tview.AlignCenter)
 
-	// Configure input field
 	ui.inputField = tview.NewInputField().
 		SetLabel("You: ").
 		SetFieldWidth(0).
 		SetFieldBackgroundColor(tcell.ColorBlack)
 	ui.inputField.SetBorder(true).SetTitle(" Input ").SetTitleAlign(tview.AlignLeft).SetBorderColor(tcell.ColorGreen)
 
-	// Configure status bar
 	ui.statusBar = tview.NewTextView()
 	ui.statusBar.SetTextAlign(tview.AlignRight).SetTextColor(tcell.ColorYellow)
 	ui.UpdateStatus(fmt.Sprintf("Model: %s | Status: Ready", ui.cfg.OpenRouter.Model))
 
-	// Layout
 	ui.flex = tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(ui.chatHistory, 0, 1, false).
@@ -134,7 +318,6 @@ func (ui *ChatUI) SetupUI() {
 		AddItem(ui.inputField, 3, 1, true).
 		AddItem(ui.statusBar, 1, 1, false)
 
-	// Set input handler
 	ui.inputField.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEnter {
 			text := ui.inputField.GetText()
@@ -145,7 +328,6 @@ func (ui *ChatUI) SetupUI() {
 		}
 	})
 
-	// Ctrl-C to quit
 	ui.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlC {
 			ui.app.Stop()
@@ -157,7 +339,7 @@ func (ui *ChatUI) SetupUI() {
 
 func (ui *ChatUI) Run() error {
 	ui.SetupUI()
-	return ui.app.SetRoot(ui.flex, true).EnableMouse(true).Run()
+	return ui.app.SetRoot(ui.flex, true).SetFocus(ui.inputField).EnableMouse(true).Run()
 }
 
 func (ui *ChatUI) UpdateStatus(text string) {
@@ -172,7 +354,6 @@ func (ui *ChatUI) StartLoading() {
 	ui.inputField.SetDisabled(true)
 	ui.assistantText = &strings.Builder{}
 
-	// Start spinner animation
 	go func() {
 		frames := []string{"⠋", "⠙", "⠹", "⠸", "⢰", "⣠", "⣄", "⣆", "⡆", "⠇"}
 		frameIdx := 0
@@ -200,12 +381,14 @@ func (ui *ChatUI) AddMessage(role, content string) {
 	ui.messages = append(ui.messages, Message{Role: role, Content: content})
 }
 
+// AppendToChat renders and displays a message in the chat view
 func (ui *ChatUI) AppendToChat(role, text string) {
 	switch role {
 	case "You":
-		fmt.Fprintf(ui.chatHistory, "[purple]You:[-] [white]%s[-]\n", text)
+		fmt.Fprintf(ui.chatHistory, "[purple]You:[-] [white]%s\n", text)
 	case "Assistant":
-		fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] [white]%s[-]\n", text)
+		formatted := ui.markdownParser.RenderMarkdown(text)
+		fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] %s\n", formatted)
 	case "System":
 		fmt.Fprintf(ui.chatHistory, "[red]System:[-] %s\n", text)
 	default:
@@ -214,23 +397,20 @@ func (ui *ChatUI) AppendToChat(role, text string) {
 	ui.chatHistory.ScrollToEnd()
 }
 
-func (ui *ChatUI) AppendToChatPlain(role, text string) {
-	fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] [yellow]%s", text)
+// AppendPartial appends streaming text with markdown applied
+func (ui *ChatUI) AppendPartialAssistant(text string) {
+	// Render partial markdown for streaming
+	formatted := ui.markdownParser.RenderPartial(text)
+	fmt.Fprintf(ui.chatHistory, "[blue]Assistant:[-] %s", formatted)
 	ui.chatHistory.ScrollToEnd()
 }
 
 func (ui *ChatUI) handleInput(input string) {
-	// Add user message to history and display (purple role)
 	ui.AddMessage("user", input)
 	ui.AppendToChat("You", input)
-
-	// Start loading animation and begin assistant response line
 	ui.StartLoading()
-	ui.AppendToChatPlain("Assistant", "")
 
-	// Send request to OpenRouter in a separate goroutine
 	go func() {
-		// Prepare request payload
 		reqBody := CompletionRequest{
 			Model:     ui.cfg.OpenRouter.Model,
 			Messages:  ui.messages,
@@ -244,7 +424,6 @@ func (ui *ChatUI) handleInput(input string) {
 			return
 		}
 
-		// Create HTTP request
 		req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions",
 			bytes.NewReader(jsonBody))
 		if err != nil {
@@ -252,12 +431,19 @@ func (ui *ChatUI) handleInput(input string) {
 			return
 		}
 
-		req.Header.Set("Authorization", "Bearer "+ui.cfg.OpenRouter.APIKey)
+		// Trim API key
+		apiKey := strings.TrimSpace(ui.cfg.OpenRouter.APIKey)
+
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("HTTP-Referer", "github.com/reVost/go-openrouter")
 		req.Header.Set("X-Title", "Go OpenRouter Client")
 
-		// Make the streaming request
+		log.Printf("Using model: %s", ui.cfg.OpenRouter.Model)
+		if len(apiKey) > 8 {
+			log.Printf("Using API key: %s...%s", apiKey[:4], apiKey[len(apiKey)-4:])
+		}
+
 		resp, err := ui.client.Do(req)
 		if err != nil {
 			ui.handleStreamError("API request error: " + err.Error())
@@ -266,16 +452,13 @@ func (ui *ChatUI) handleInput(input string) {
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			// Read the error response
 			errBody, _ := io.ReadAll(resp.Body)
-			errMsg := fmt.Sprintf("API error: %s - %s", resp.Status, string(errBody))
-			ui.handleStreamError(errMsg)
+			ui.handleStreamError(fmt.Sprintf("API error (%d): %s", resp.StatusCode, string(errBody)))
 			return
 		}
 
-		// Process SSE streaming response
 		reader := bufio.NewReader(resp.Body)
-		isFirst := true
+		var responseStarted bool
 
 		for {
 			line, err := reader.ReadString('\n')
@@ -283,28 +466,26 @@ func (ui *ChatUI) handleInput(input string) {
 				if errors.Is(err, io.EOF) {
 					break
 				}
-				ui.appendSystemError("Stream read error: " + err.Error())
+				log.Printf("Stream read error: %v", err)
 				break
 			}
 
-			// Skip empty lines and SSE comment lines
+			// Skip empty lines and SSE comments
 			if strings.TrimSpace(line) == "" || strings.HasPrefix(line, ":") {
 				continue
 			}
 
-			// Check for data prefix
 			if strings.HasPrefix(line, "data:") {
 				jsonStr := strings.TrimPrefix(line, "data:")
 				jsonStr = strings.TrimSpace(jsonStr)
 
-				// Check for special "[DONE]" message
 				if jsonStr == "[DONE]" {
 					break
 				}
 
 				var chunk CompletionResponse
 				if err := json.Unmarshal([]byte(jsonStr), &chunk); err != nil {
-					ui.appendSystemError("JSON parse error: " + err.Error())
+					log.Printf("JSON parse error: %v", err)
 					continue
 				}
 
@@ -312,85 +493,37 @@ func (ui *ChatUI) handleInput(input string) {
 					delta := chunk.Choices[0].Delta.Content
 					ui.assistantText.WriteString(delta)
 
-					// Update UI with the new content
-					ui.app.QueueUpdateDraw(func() {
-						// For the first chunk, setup the assistant line
-						if isFirst {
-							ui.AppendToChatPlain("Assistant", "[yellow]")
-							isFirst = false
-						}
-
-						ui.appendDelta(delta)
-					})
+					if !responseStarted {
+						responseStarted = true
+						ui.app.QueueUpdateDraw(func() {
+							ui.AppendPartialAssistant(delta)
+						})
+					} else {
+						ui.app.QueueUpdateDraw(func() {
+							ui.AppendPartialAssistant(delta)
+						})
+					}
 				}
 			}
 		}
 
-		// Add final assistant response
-		finalResponse := ui.assistantText.String()
-		if finalResponse != "" {
-			ui.app.QueueUpdateDraw(func() {
-				// Save assistant response to message history
+		ui.app.QueueUpdateDraw(func() {
+			// Add full message with final markdown rendering
+			finalResponse := ui.assistantText.String()
+			if finalResponse != "" {
 				ui.AddMessage("assistant", finalResponse)
-				ui.StopLoading()
+				ui.AddCompletedAssistantMessage(finalResponse)
+			} else if !responseStarted {
+				ui.AppendToChat("System", "Assistant returned an empty response")
+			}
 
-				// Remove the streaming marker and reset to white
-				ui.finalizeAssistantMessage()
-			})
-		} else {
 			ui.StopLoading()
-		}
+		})
 	}()
 }
 
-// appendDelta adds a new chunk to the assistant response in yellow
-func (ui *ChatUI) appendDelta(delta string) {
-	currentText := ui.chatHistory.GetText(true)
-
-	// Find last line and append new content
-	lines := strings.Split(currentText, "\n")
-	if len(lines) > 0 {
-		lastLine := lines[len(lines)-1]
-
-		// Handle the case where we might have ANSI codes at the end
-		if strings.HasSuffix(lastLine, "[-]") {
-			lastLine = strings.TrimSuffix(lastLine, "[-]")
-		}
-
-		// Append the new delta
-		lastLine += delta
-
-		// Note: We explicitly keep yellow open for additional tokens
-		lastLine += "[yellow]"
-
-		// Update the last line
-		lines[len(lines)-1] = lastLine
-		ui.chatHistory.SetText(strings.Join(lines, "\n"))
-	}
-
-	ui.chatHistory.ScrollToEnd()
-}
-
-// finalizeAssistantMessage removes yellow coloring from the assistant's message
-func (ui *ChatUI) finalizeAssistantMessage() {
-	currentText := ui.chatHistory.GetText(true)
-	lines := strings.Split(currentText, "\n")
-
-	if len(lines) == 0 {
-		return
-	}
-
-	// Process the last line (assistant's response)
-	lastLine := lines[len(lines)-1]
-
-	// Remove any open yellow tags and their endings
-	lastLine = strings.ReplaceAll(lastLine, "[yellow]", "")
-	lastLine = strings.ReplaceAll(lastLine, "[-]", "")
-
-	// Recolor assistant response to white
-	lines[len(lines)-1] = lastLine
-	ui.chatHistory.SetText(strings.Join(lines, "\n") + "\n")
-	ui.chatHistory.ScrollToEnd()
+func (ui *ChatUI) AddCompletedAssistantMessage(text string) {
+	ui.AppendToChat("Assistant", text)
 }
 
 func (ui *ChatUI) handleStreamError(msg string) {
@@ -400,20 +533,55 @@ func (ui *ChatUI) handleStreamError(msg string) {
 	})
 }
 
-func (ui *ChatUI) appendSystemError(msg string) {
-	ui.app.QueueUpdateDraw(func() {
-		ui.AppendToChat("System", msg)
-	})
-}
-
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Fatalf("Config Error: %v", err)
+		log.Printf("Config error: %v", err)
+
+		if strings.Contains(err.Error(), "API key is not configured") {
+			log.Println("Please update config.yaml with your API key and restart")
+			log.Println("You can get your API key at: https://openrouter.ai/keys")
+			os.Exit(1)
+		}
+
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			log.Println("Creating default config file...")
+			if _, err := os.Stat("config.yaml"); os.IsNotExist(err) {
+				file, createErr := os.Create("config.yaml")
+				if createErr != nil {
+					log.Fatalf("Failed to create config file: %v", createErr)
+				}
+				file.Close()
+			}
+
+			v := viper.New()
+			v.SetConfigFile("config.yaml")
+			v.Set("openrouter", map[string]interface{}{
+				"api_key":    "your-api-key-here",
+				"model":      "openai/gpt-3.5-turbo",
+				"timeout":    30,
+				"max_tokens": 512,
+			})
+
+			if err := v.WriteConfig(); err != nil {
+				log.Fatalf("Failed to write config: %v", err)
+			}
+
+			log.Println("Created config.yaml. Please update with your API key")
+			log.Println("Rerun the application after setup")
+			os.Exit(0)
+		} else {
+			log.Fatalf("Fatal config error: %v", err)
+		}
+	}
+
+	log.Printf("Loaded model: %s", cfg.OpenRouter.Model)
+	if len(cfg.OpenRouter.APIKey) > 8 {
+		log.Printf("Using API key: %s...%s", cfg.OpenRouter.APIKey[:4], cfg.OpenRouter.APIKey[len(cfg.OpenRouter.APIKey)-4:])
 	}
 
 	ui := NewChatUI(cfg)
 	if err := ui.Run(); err != nil {
-		log.Fatalf("TUI Error: %v", err)
+		log.Fatalf("UI Error: %v", err)
 	}
 }
